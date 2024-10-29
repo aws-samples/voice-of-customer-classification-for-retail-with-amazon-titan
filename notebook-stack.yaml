@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a SageMaker Notebook Instance
+
+Parameters:
+  NotebookInstanceName:
+    Type: String
+    Default: voc-notebook-instance
+  InstanceType:
+    Type: String
+    Default: ml.t3.large
+  VolumeSizeInGB:
+    Type: Number
+    Default: 100
+  KmsKeyId:
+    Type: String
+    Description: The AWS KMS key ID used to encrypt the notebook instance volume
+    Default: ''
+    AllowedPattern: '.*'
+    ConstraintDescription: Must be a valid KMS Key ID or empty.
+
+Conditions:
+  HasKmsKeyId: !Not [!Equals [!Ref KmsKeyId, '']]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: SageMaker VPC
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: SageMaker Subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  NotebookInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTPS access to the notebook instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          
+  NotebookInstanceLifecycleConfig:
+    Type: AWS::SageMaker::NotebookInstanceLifecycleConfig
+    Properties:
+      NotebookInstanceLifecycleConfigName: CloneGitRepo
+      OnStart: 
+        - Content: 
+            Fn::Base64: |
+              #!/bin/bash
+              set -e
+              # Switch to the SageMaker directory
+              cd /home/ec2-user/SageMaker
+ 
+              # Clone the repository as the ec2-user
+              git clone https://github.com/aws-samples/voice-of-customer-classification-for-retail-with-amazon-titan.git
+      
+              # Set proper permissions for the cloned directory
+              sudo chown -R ec2-user:ec2-user /home/ec2-user/SageMaker/
+
+  NotebookInstance:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: !Ref NotebookInstanceName
+      InstanceType: !Ref InstanceType
+      RoleArn: !GetAtt ExecutionRole.Arn
+      DirectInternetAccess: Enabled
+      VolumeSizeInGB: !Ref VolumeSizeInGB
+      SubnetId: !Ref Subnet
+      KmsKeyId: !If [HasKmsKeyId, !Ref KmsKeyId, !Ref 'AWS::NoValue']
+      LifecycleConfigName: !GetAtt NotebookInstanceLifecycleConfig.NotebookInstanceLifecycleConfigName
+      SecurityGroupIds: 
+        - !Ref NotebookInstanceSecurityGroup
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSageMakerFullAccess'
+
+      Policies:
+        - PolicyName: SageMakerNotebookInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModelWithResponseStream'
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:GetUseCaseForModelAccess'
+                  - 'bedrock:PutUseCaseForModelAccess'
+                  - 'bedrock:GetFoundationModelAvailability'
+                  - 'bedrock:ListFoundationModels'
+                  - 'bedrock:PutFoundationModelEntitlement'
+                Resource: '*'
+
+Outputs:
+  NotebookInstanceName:
+    Description: Name of the Notebook Instance
+    Value: !Ref NotebookInstance
+  NotebookInstanceUrl:
+    Description: URL of the Notebook Instance
+    Value: !Sub 'https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/notebook-instances/openNotebook/${NotebookInstance}?view=classic'
